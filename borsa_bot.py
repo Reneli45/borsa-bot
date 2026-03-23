@@ -1,6 +1,6 @@
 """
 ULS + Fibonacci EMA Borsa Tarama Botu v4
-- BIST: 45 hisse, 10B TL+, 18:30
+- BIST: ~100 hisse (BIST100), 10B TL+, 18:30
 - ABD S&P500+: 314 hisse, 10B $+, 23:30
 - TradingView uyumlu: Wilder ATR/ADX/RSI
 - Telegram manuel sorgulama
@@ -18,6 +18,8 @@ import threading
 TELEGRAM_TOKEN   = "8644118927:AAHwT1tHdfoEVZ-W8hpCJk9HJJT8iItul14"
 TELEGRAM_CHAT_ID = "-1003848631204"
 son_update_id    = 0
+tarama_kilidi    = threading.Lock()
+tarama_aktif     = False
  
 def telegram_gonder(mesaj, chat_id=None):
     if chat_id is None:
@@ -107,7 +109,15 @@ def hisse_analiz(ticker):
         if mktcap > 0 and mktcap < min_cap:
             return None, f"Kucuk sirket ({mktcap/1e9:.1f}B)"
  
-        df = yf.download(ticker, period="2y", interval="1d", progress=False, auto_adjust=True)
+        df = None
+        for deneme in range(3):
+            try:
+                df = yf.download(ticker, period="2y", interval="1d", progress=False, auto_adjust=True)
+                if df is not None and len(df) >= 250:
+                    break
+                time.sleep(1)
+            except:
+                time.sleep(2)
         if df is None or len(df) < 250:
             return None, "Yeterli veri yok"
  
@@ -333,12 +343,30 @@ def tarama_yap(hisseler, baslik):
         time.sleep(0.8)
  
 def bist_tarama():
-    print(f"\nBIST TARAMA: {datetime.now().strftime('%H:%M')}")
-    tarama_yap(BIST_HISSELER, "BIST")
+    global tarama_aktif
+    with tarama_kilidi:
+        if tarama_aktif:
+            print("Tarama zaten devam ediyor, atlandi.")
+            return
+        tarama_aktif = True
+    try:
+        print(f"\nBIST TARAMA: {datetime.now().strftime('%H:%M')}")
+        tarama_yap(BIST_HISSELER, "BIST")
+    finally:
+        tarama_aktif = False
  
 def abd_tarama():
-    print(f"\nABD TARAMA: {datetime.now().strftime('%H:%M')}")
-    tarama_yap(ABD_HISSELER, f"ABD S&P500+ ({len(ABD_HISSELER)} hisse)")
+    global tarama_aktif
+    with tarama_kilidi:
+        if tarama_aktif:
+            print("Tarama zaten devam ediyor, atlandi.")
+            return
+        tarama_aktif = True
+    try:
+        print(f"\nABD TARAMA: {datetime.now().strftime('%H:%M')}")
+        tarama_yap(ABD_HISSELER, f"ABD S&P500+ ({len(ABD_HISSELER)} hisse)")
+    finally:
+        tarama_aktif = False
  
 # ══════════════════════════════════════════════
 # TELEGRAM DINLEYICI
@@ -408,6 +436,18 @@ def mesaji_isle(metin, chat_id):
 def telegram_dinle():
     global son_update_id
     print("Telegram dinleniyor...")
+    # Eski mesajlari atla - bot yeniden basladiginda gecmis mesajlari isleme
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+        r = requests.get(url, params={"offset": -1}, timeout=10)
+        if r.status_code == 200:
+            sonuclar = r.json().get("result", [])
+            if sonuclar:
+                son_update_id = sonuclar[-1]["update_id"]
+                print(f"Eski mesajlar atlandi. Son ID: {son_update_id}")
+    except:
+        pass
+ 
     while True:
         try:
             for m in telegram_mesajlari_al():
