@@ -120,11 +120,11 @@ def hisse_analiz(ticker):
 
         _, _, adx_s = tv_dmi(df, 14)
         adx_val = float(adx_s.iloc[-1])
-        adxOK   = adx_val >= 20
+        adxOK   = adx_val >= 15
 
         rsi_s   = tv_rsi(close, 14)
         rsi_val = float(rsi_s.iloc[-1])
-        rsiOK   = 50 <= rsi_val <= 75
+        rsiOK   = 45 <= rsi_val <= 80
 
         ml, ms, mh = tv_macd(close, 12, 26, 9)
         macdOK = bool(ml.iloc[-1] > ms.iloc[-1]) and bool(mh.iloc[-1] > 0)
@@ -150,8 +150,8 @@ def hisse_analiz(ticker):
 
         eksik = []
         if not trendOK: eksik.append("EMA200")
-        if not adxOK:   eksik.append(f"ADX({adx_val:.0f})")
-        if not rsiOK:   eksik.append(f"RSI({rsi_val:.0f})")
+        if not adxOK:   eksik.append(f"ADX({adx_val:.0f})<15")
+        if not rsiOK:   eksik.append(f"RSI({rsi_val:.0f}) 45-80 olmali")
         if not macdOK:  eksik.append("MACD")
         if not brkout:  eksik.append("Turtle")
         if not fibOK:   eksik.append(f"Fib({fib}/7)")
@@ -436,6 +436,7 @@ if __name__ == "__main__":
         f"🇹🇷 BIST: {len(BIST_HISSELER)} hisse → 18:30\n"
         f"🇺🇸 ABD S&P500+: {len(ABD_HISSELER)} hisse → 23:30\n\n"
         f"📐 TradingView tam uyumlu\n"
+        f"📊 Filtreler: RSI 45-80 | ADX 15+\n"
         f"💹 Piyasa degeri filtresi: 10B+\n\n"
         f"Test: THYAO veya AAPL yaz\n"
         f"/yardim → komutlar"
