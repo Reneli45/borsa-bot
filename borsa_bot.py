@@ -97,6 +97,81 @@ def tv_macd(close, fast=12, slow=26, signal=9):
 # ══════════════════════════════════════════════
 # HISSE ANALİZ
 # ══════════════════════════════════════════════
+ 
+def turtle_analiz(ticker):
+    """Saf Richard Dennis Turtle - sadece 40G kirilim + ATR stop"""
+    try:
+        piyasa  = "BIST" if ticker.endswith(".IS") else "ABD"
+        min_cap = 10_000_000_000
+        try:
+            bilgi  = yf.Ticker(ticker).info
+            mktcap = bilgi.get("marketCap", 0) or 0
+        except:
+            mktcap = 0
+        if mktcap > 0 and mktcap < min_cap:
+            return None, f"Kucuk sirket"
+ 
+        df = None
+        for deneme in range(3):
+            try:
+                df = yf.download(ticker, period="2y", interval="1d", progress=False, auto_adjust=True)
+                if df is not None and len(df) >= 60:
+                    break
+                time.sleep(1)
+            except:
+                time.sleep(2)
+ 
+        if df is None or len(df) < 60:
+            return None, "Yeterli veri yok"
+ 
+        close = df["Close"].squeeze()
+        high  = df["High"].squeeze()
+        low   = df["Low"].squeeze()
+ 
+        # 40 gunluk Donchian - onceki bar [1]
+        don_hi40 = high.rolling(40).max().shift(1)
+        don_lo40 = low.rolling(40).min().shift(1)
+        # Cikis: 20 gunluk dusuk
+        don_ex20 = low.rolling(20).min().shift(1)
+ 
+        # Kirilim kontrolu
+        brkout = bool(close.iloc[-1] > don_hi40.iloc[-1])
+        if not brkout:
+            return None, "Kirilim yok"
+ 
+        # ATR - Wilder RMA
+        N_s  = tv_atr(df, 20)
+        N    = float(N_s.iloc[-1])
+        risk = N * 2.0
+        fyt  = float(close.iloc[-1])
+ 
+        # Dennis'in orijinal seviyeleri
+        sl   = fyt - risk
+        tp1  = fyt + risk * 1.5
+        tp2  = fyt + risk * 3.0
+        tp3  = fyt + risk * 5.0
+ 
+        # 40G yuksek ve onceki kapanisla mesafe
+        mesafe = (fyt - float(don_hi40.iloc[-1])) / fyt * 100
+ 
+        return {
+            "ticker"  : ticker,
+            "piyasa"  : piyasa,
+            "giris"   : round(fyt, 2),
+            "sl"      : round(sl, 2),
+            "tp1"     : round(tp1, 2),
+            "tp2"     : round(tp2, 2),
+            "tp3"     : round(tp3, 2),
+            "atr"     : round(N, 2),
+            "don_hi"  : round(float(don_hi40.iloc[-1]), 2),
+            "don_ex"  : round(float(don_ex20.iloc[-1]), 2),
+            "mesafe"  : round(mesafe, 2),
+            "mktcap"  : mktcap,
+        }, None
+ 
+    except Exception as e:
+        return None, str(e)
+ 
 def hisse_analiz(ticker):
     try:
         piyasa  = "BIST" if ticker.endswith(".IS") else "ABD"
@@ -368,6 +443,81 @@ def abd_tarama():
     finally:
         tarama_aktif = False
  
+ 
+def turtle_tarama_yap(hisseler, baslik):
+    simdi     = datetime.now().strftime("%d.%m.%Y %H:%M")
+    sinyaller = []
+    telegram_gonder(
+        f"🐢 <b>{baslik} TURTLE TARAMASI</b>\n"
+        f"⏰ {simdi}\n"
+        f"📊 {len(hisseler)} hisse - 40G Dennis Sistemi"
+    )
+    for ticker in hisseler:
+        print(f"  TURTLE {ticker}...", end=" ", flush=True)
+        sonuc, _ = turtle_analiz(ticker)
+        if sonuc:
+            sinyaller.append(sonuc)
+            print("KIRILIM!")
+        else:
+            print("-")
+        time.sleep(0.3)
+ 
+    if not sinyaller:
+        telegram_gonder(f"🐢 <b>{baslik} TURTLE</b> — Kirilim bulunamadi.")
+        return
+ 
+    telegram_gonder(
+        f"🐢 <b>{baslik} TURTLE SINYALLERI</b>\n"
+        f"⏰ {simdi}\n"
+        f"📊 {len(sinyaller)} hisse 40G kirildi!"
+    )
+    time.sleep(1)
+    for s in sinyaller:
+        bayrak = "🇹🇷" if s["piyasa"] == "BIST" else "🇺🇸"
+        para   = "₺" if s["piyasa"] == "BIST" else "$"
+        cap    = f"{s['mktcap']/1e9:.1f}B {para}" if s["mktcap"] > 0 else "?"
+        mesaj  = (
+            f"🐢 {bayrak} <b>{s['ticker']}</b> — 40G KIRILIM\n"
+            f"💹 Piyasa Degeri: {cap}\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"💰 Giris:    {para}{s['giris']}\n"
+            f"🛑 S/L:      {para}{s['sl']}\n"
+            f"🎯 TP1:     {para}{s['tp1']}\n"
+            f"🎯 TP2:     {para}{s['tp2']}\n"
+            f"🎯 TP3:     {para}{s['tp3']}\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"📏 40G Yuksek: {para}{s['don_hi']}\n"
+            f"🚪 Cikis 20G:  {para}{s['don_ex']}\n"
+            f"🔢 ATR (N):    {para}{s['atr']}\n"
+            f"📐 Mesafe:     %{s['mesafe']}\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"⚠️ Yatirim tavsiyesi degildir."
+        )
+        telegram_gonder(mesaj)
+        time.sleep(0.8)
+ 
+def bist_turtle():
+    global tarama_aktif
+    with tarama_kilidi:
+        if tarama_aktif:
+            return
+        tarama_aktif = True
+    try:
+        turtle_tarama_yap(BIST_HISSELER, "BIST")
+    finally:
+        tarama_aktif = False
+ 
+def abd_turtle():
+    global tarama_aktif
+    with tarama_kilidi:
+        if tarama_aktif:
+            return
+        tarama_aktif = True
+    try:
+        turtle_tarama_yap(ABD_HISSELER, "ABD")
+    finally:
+        tarama_aktif = False
+ 
 # ══════════════════════════════════════════════
 # TELEGRAM DINLEYICI
 # ══════════════════════════════════════════════
@@ -384,7 +534,11 @@ def yardim_mesaji():
         "/abd    ABD tara\n"
         "/tara   Hepsini tara\n"
         "/liste  Kac hisse var\n"
-        "/yardim Bu menu"
+        "/yardim Bu menu\n\n"
+        "🐢 Turtle Komutlar:\n"
+        "/turtle_bist  BIST Turtle tara\n"
+        "/turtle_abd   ABD Turtle tara\n"
+        "/turtle_tara  Her ikisi Turtle"
     )
  
 def mesaji_isle(metin, chat_id):
@@ -417,6 +571,19 @@ def mesaji_isle(metin, chat_id):
         telegram_gonder("🔍 Tum piyasalar taranıyor...", chat_id)
         threading.Thread(target=bist_tarama, daemon=True).start()
         threading.Thread(target=abd_tarama,  daemon=True).start()
+        return
+    if cmd == "/TURTLE_BIST":
+        telegram_gonder("🐢 BIST Turtle taramasi baslatiliyor...", chat_id)
+        threading.Thread(target=bist_turtle, daemon=True).start()
+        return
+    if cmd == "/TURTLE_ABD":
+        telegram_gonder("🐢 ABD Turtle taramasi baslatiliyor...", chat_id)
+        threading.Thread(target=abd_turtle, daemon=True).start()
+        return
+    if cmd == "/TURTLE_TARA":
+        telegram_gonder("🐢 Turtle taramasi baslatiliyor...", chat_id)
+        threading.Thread(target=bist_turtle, daemon=True).start()
+        threading.Thread(target=abd_turtle,  daemon=True).start()
         return
  
     ticker = cmd.replace("/", "")
@@ -484,7 +651,9 @@ if __name__ == "__main__":
     print("Bot aktif!\n")
  
     schedule.every().day.at("18:30").do(bist_tarama)
+    schedule.every().day.at("19:00").do(bist_turtle)
     schedule.every().day.at("23:30").do(abd_tarama)
+    schedule.every().day.at("00:00").do(abd_turtle)
  
     threading.Thread(target=telegram_dinle, daemon=True).start()
  
