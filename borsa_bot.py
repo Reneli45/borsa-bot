@@ -614,7 +614,12 @@ def tarama_yap(hisseler, baslik):
         )
         mesaj = sinyal_mesaji(s, sid)
         for cid in kullanicilar:
-            telegram_gonder(mesaj, cid)
+            # Butonlu gonder
+            telegram_gonder_butonlu(
+                mesaj, cid,
+                s["ticker"], s["giris"], s["sl"], s["tp1"],
+                sid
+            )
             time.sleep(0.3)
         time.sleep(0.5)
 
@@ -725,7 +730,9 @@ def yardim_mesaji():
         "/stat_tum    — Tüm zamanlar\n\n"
         "💼 Portföy:\n"
         "/acik    — Acik pozisyonlar\n"
-        "/gecmis  — Son 10 islem\n\n"
+        "/kapat THYAO 395.50 — Kapat\n"
+        "/gecmis  — Son 10 islem\n"
+        "/kapat THYAO 395.50 — Pozisyon kapat\n\n"
         "⏰ Otomatik: BIST 18:30 / ABD 23:30"
     )
 
@@ -802,6 +809,37 @@ def mesaji_isle(metin, chat_id, isim):
         threading.Thread(target=abd_turtle,  daemon=True).start()
         return
 
+    # KAPAT komutu: /kapat THYAO 395.50
+    if cmd.startswith("/KAPAT"):
+        parcalar = metin.strip().split()
+        if len(parcalar) < 3:
+            telegram_gonder("Format: /kapat THYAO 395.50", chat_id)
+            return
+        tk = parcalar[1].upper()
+        try:
+            fk = float(parcalar[2])
+        except:
+            telegram_gonder("Gecersiz fiyat", chat_id)
+            return
+        dbx = db_oku()
+        if tk not in dbx["acik_pozisyonlar"] and tk + ".IS" in dbx["acik_pozisyonlar"]:
+            tk = tk + ".IS"
+        if tk not in dbx["acik_pozisyonlar"]:
+            telegram_gonder("Acik pozisyon yok: " + tk, chat_id)
+            return
+        sidx = dbx["acik_pozisyonlar"][tk]
+        gf = 0
+        for sx in dbx["sinyaller"]:
+            if sx["id"] == sidx:
+                gf = sx["giris"]
+                break
+        pozisyon_kapat(tk, "KAPANDI", fk)
+        kz = (fk - gf) / gf * 1000 if gf > 0 else 0
+        pnl = ("+" if kz >= 0 else "") + "$" + str(round(kz, 2))
+        durum = "KAR" if kz >= 0 else "ZARAR"
+        telegram_gonder(durum + " | " + tk + " | Giris:" + str(gf) + " Cikis:" + str(fk) + " PnL:" + pnl, chat_id)
+        return
+
     # LISTE
     if cmd == "/LISTE":
         telegram_gonder(
@@ -827,6 +865,84 @@ def mesaji_isle(metin, chat_id, isim):
             f"Hata: {hata}", chat_id)
         return
     telegram_gonder(detay_mesaji(sonuc), chat_id)
+
+
+def telegram_gonder_butonlu(mesaj, chat_id, ticker, giris, sl, tp1, sinyal_id):
+    """Sinyal mesajini onayla/reddet butonlariyla gonder"""
+    url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    # Midas arama linki
+    midas_link = f"https://getmidas.com"
+    
+    # Lot hesapla (yaklasik 1000 TL / hisse fiyati)
+    lot = max(1, int(1000 / giris)) if giris > 0 else 1
+    
+    keyboard = {
+        "inline_keyboard": [
+            [
+                {"text": "✅ ONAYLA - Midas'ta Ac", "url": midas_link},
+                {"text": "❌ REDDET", "callback_data": f"reddet_{sinyal_id}"}
+            ],
+            [
+                {"text": f"📋 {ticker} | Giris: {giris} | Lot: ~{lot}", 
+                 "callback_data": f"bilgi_{sinyal_id}"}
+            ]
+        ]
+    }
+    veri = {
+        "chat_id"     : chat_id,
+        "text"        : mesaj,
+        "parse_mode"  : "HTML",
+        "reply_markup": json.dumps(keyboard)
+    }
+    try:
+        r = requests.post(url, json=veri, timeout=10)
+        return r.status_code == 200
+    except Exception as e:
+        print(f"Butonlu mesaj hata: {e}")
+        return False
+
+def telegram_callback_cevapla(callback_query_id, metin):
+    """Inline buton tiklandiginda cevap ver"""
+    url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery"
+    veri = {"callback_query_id": callback_query_id, "text": metin, "show_alert": False}
+    try:
+        requests.post(url, data=veri, timeout=5)
+    except:
+        pass
+
+def callback_isle(callback_query):
+    """Inline buton tiklandiginda islem yap"""
+    global son_update_id
+    cid     = callback_query["message"]["chat"]["id"]
+    data    = callback_query.get("data", "")
+    qid     = callback_query["id"]
+    
+    if data.startswith("reddet_"):
+        sid = int(data.replace("reddet_", ""))
+        pozisyon_kapat_by_id(sid, "REDDEDILDI", 0)
+        telegram_callback_cevapla(qid, "❌ Sinyal reddedildi")
+        telegram_gonder(f"❌ Sinyal #{sid} reddedildi. Kayıt tutuldu.", cid)
+    elif data.startswith("bilgi_"):
+        telegram_callback_cevapla(qid, "ℹ️ Sinyal detayi yukarıda")
+
+def pozisyon_kapat_by_id(sinyal_id, durum, son_fiyat):
+    db = db_oku()
+    for s in db["sinyaller"]:
+        if s["id"] == sinyal_id and s["durum"] == "ACIK":
+            s["durum"]    = durum
+            s["kapanma"]  = datetime.now().strftime("%Y-%m-%d %H:%M")
+            if son_fiyat > 0:
+                kar = (son_fiyat - s["giris"]) / s["giris"] * 1000
+                s["kar_zarar"] = round(kar, 2)
+                s["sonuc"]     = "KAR" if kar > 0 else "ZARAR"
+            else:
+                s["kar_zarar"] = 0
+                s["sonuc"]     = "REDDEDILDI"
+            ticker = s["ticker"]
+            if ticker in db["acik_pozisyonlar"]:
+                del db["acik_pozisyonlar"][ticker]
+            break
+    db_kaydet(db)
 
 def telegram_dinle():
     global son_update_id
@@ -857,6 +973,12 @@ def telegram_dinle():
                         args=(metin, chat_id, isim),
                         daemon=True
                     ).start()
+                elif "callback_query" in m:
+                    threading.Thread(
+                        target=callback_isle,
+                        args=(m["callback_query"],),
+                        daemon=True
+                    ).start()
             time.sleep(2)
         except Exception as e:
             print(f"Dinleme hatasi: {e}")
@@ -876,7 +998,7 @@ if __name__ == "__main__":
 
     telegram_gonder(
         "✅ <b>ULS+FIB Sinyal Botu Aktif!</b>\n\n"
-        f"🇹🇷 BIST: {len(BIST_HISSELER)} hisse → 18:30\n"
+        f"🇹🇷 BIST: {len(BIST_HISSELER)} hisse → 10:00/12:00/14:00/16:00/18:00/18:30\n"
         f"🇺🇸 ABD: {len(ABD_HISSELER)} hisse → 23:30\n\n"
         "📊 Yeni ozellikler:\n"
         "✅ Coklu kullanici\n"
@@ -889,8 +1011,16 @@ if __name__ == "__main__":
     print("Bot aktif!\n")
 
     # Zamanlayici
+    # BIST - piyasa saatlerinde 2 saatte bir (10:00 - 18:30)
+    schedule.every().day.at("10:00").do(bist_tarama)
+    schedule.every().day.at("12:00").do(bist_tarama)
+    schedule.every().day.at("14:00").do(bist_tarama)
+    schedule.every().day.at("16:00").do(bist_tarama)
+    schedule.every().day.at("18:00").do(bist_tarama)
     schedule.every().day.at("18:30").do(bist_tarama)
+    # BIST Turtle - kapanista
     schedule.every().day.at("19:00").do(bist_turtle)
+    # ABD - kapanista
     schedule.every().day.at("23:30").do(abd_tarama)
     schedule.every().day.at("00:00").do(abd_turtle)
 
