@@ -1,20 +1,25 @@
 """
-ULS + Fibonacci EMA Borsa Tarama Botu v4
-- BIST: ~100 hisse (BIST100), 10B TL+, 18:30
-- ABD S&P500+: 314 hisse, 10B $+, 23:30
-- TradingView uyumlu: Wilder ATR/ADX/RSI
-- Telegram manuel sorgulama
+ULS + Fibonacci EMA Borsa Tarama Botu
+- Çoklu kullanıcı desteği
+- Sinyal + istatistik + portföy takibi
+- $1000 işlem / $100K portföy simülasyonu
+- BIST 18:30 / ABD 23:30 otomatik tarama
 """
 
 import requests
 import pandas as pd
 import numpy as np
 import yfinance as yf
-from datetime import datetime
+from datetime import datetime, timedelta
 import time
 import schedule
 import threading
+import json
+import os
 
+# ══════════════════════════════════════════════
+# TELEGRAM
+# ══════════════════════════════════════════════
 TELEGRAM_TOKEN   = "8644118927:AAHwT1tHdfoEVZ-W8hpCJk9HJJT8iItul14"
 TELEGRAM_CHAT_ID = "-1003848631204"
 son_update_id    = 0
@@ -45,7 +50,87 @@ def telegram_mesajlari_al():
     return []
 
 # ══════════════════════════════════════════════
-# TRADINGVIEW UYUMLU HESAPLAMALAR
+# VERİTABANI (JSON dosyasi)
+# ══════════════════════════════════════════════
+DB_FILE = "borsa_db.json"
+
+def db_oku():
+    if os.path.exists(DB_FILE):
+        try:
+            with open(DB_FILE, "r") as f:
+                return json.load(f)
+        except:
+            pass
+    return {
+        "kullanicilar": {},
+        "sinyaller": [],
+        "acik_pozisyonlar": {}
+    }
+
+def db_kaydet(db):
+    with open(DB_FILE, "w") as f:
+        json.dump(db, f, indent=2, ensure_ascii=False)
+
+def kullanici_ekle(chat_id, isim):
+    db = db_oku()
+    cid = str(chat_id)
+    if cid not in db["kullanicilar"]:
+        db["kullanicilar"][cid] = {
+            "isim"    : isim,
+            "katilim" : datetime.now().strftime("%Y-%m-%d"),
+            "aktif"   : True
+        }
+        db_kaydet(db)
+        return True
+    return False
+
+def aktif_kullanicilar():
+    db = db_oku()
+    return [cid for cid, u in db["kullanicilar"].items() if u.get("aktif", True)]
+
+def sinyal_kaydet(ticker, piyasa, giris, sl, tp1, tp2, tp3, atr, fib, uls):
+    db = db_oku()
+    sinyal = {
+        "id"      : len(db["sinyaller"]) + 1,
+        "tarih"   : datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "ticker"  : ticker,
+        "piyasa"  : piyasa,
+        "giris"   : giris,
+        "sl"      : sl,
+        "tp1"     : tp1,
+        "tp2"     : tp2,
+        "tp3"     : tp3,
+        "atr"     : atr,
+        "fib"     : fib,
+        "uls"     : uls,
+        "durum"   : "ACIK",
+        "sonuc"   : None,
+        "kar_zarar": None,
+        "kapanma" : None
+    }
+    db["sinyaller"].append(sinyal)
+    db["acik_pozisyonlar"][ticker] = sinyal["id"]
+    db_kaydet(db)
+    return sinyal["id"]
+
+def pozisyon_kapat(ticker, durum, son_fiyat):
+    db = db_oku()
+    if ticker not in db["acik_pozisyonlar"]:
+        return
+    sid = db["acik_pozisyonlar"][ticker]
+    for s in db["sinyaller"]:
+        if s["id"] == sid:
+            s["durum"]    = durum
+            s["kapanma"]  = datetime.now().strftime("%Y-%m-%d %H:%M")
+            kar = (son_fiyat - s["giris"]) / s["giris"] * 1000
+            s["kar_zarar"] = round(kar, 2)
+            s["sonuc"]     = "KAR" if kar > 0 else "ZARAR"
+            break
+    del db["acik_pozisyonlar"][ticker]
+    db_kaydet(db)
+
+# ══════════════════════════════════════════════
+# TV UYUMLU HESAPLAMALAR
 # ══════════════════════════════════════════════
 def tv_ema(seri, periyot):
     return seri.ewm(span=periyot, adjust=False).mean()
@@ -97,95 +182,20 @@ def tv_macd(close, fast=12, slow=26, signal=9):
 # ══════════════════════════════════════════════
 # HISSE ANALİZ
 # ══════════════════════════════════════════════
-
-def turtle_analiz(ticker):
-    """Saf Richard Dennis Turtle - sadece 40G kirilim + ATR stop"""
-    try:
-        piyasa  = "BIST" if ticker.endswith(".IS") else "ABD"
-        min_cap = 10_000_000_000
-        try:
-            bilgi  = yf.Ticker(ticker).info
-            mktcap = bilgi.get("marketCap", 0) or 0
-        except:
-            mktcap = 0
-        if mktcap > 0 and mktcap < min_cap:
-            return None, f"Kucuk sirket"
-
-        df = None
-        for deneme in range(3):
-            try:
-                df = yf.download(ticker, period="2y", interval="1d", progress=False, auto_adjust=True)
-                if df is not None and len(df) >= 60:
-                    break
-                time.sleep(1)
-            except:
-                time.sleep(2)
-
-        if df is None or len(df) < 45:
-            return None, "Yeterli veri yok"
-
-        close = df["Close"].squeeze()
-        high  = df["High"].squeeze()
-        low   = df["Low"].squeeze()
-
-        # 40 gunluk Donchian - onceki bar [1]
-        don_hi40 = high.rolling(40).max().shift(1)
-        don_lo40 = low.rolling(40).min().shift(1)
-        # Cikis: 20 gunluk dusuk
-        don_ex20 = low.rolling(20).min().shift(1)
-
-        # Kirilim kontrolu
-        brkout = bool(close.iloc[-1] > don_hi40.iloc[-1])
-        if not brkout:
-            return None, "Kirilim yok"
-
-        # ATR - Wilder RMA
-        N_s  = tv_atr(df, 20)
-        N    = float(N_s.iloc[-1])
-        risk = N * 2.0
-        fyt  = float(close.iloc[-1])
-
-        # Dennis'in orijinal seviyeleri
-        sl   = fyt - risk
-        tp1  = fyt + risk * 1.5
-        tp2  = fyt + risk * 3.0
-        tp3  = fyt + risk * 5.0
-
-        # 40G yuksek ve onceki kapanisla mesafe
-        mesafe = (fyt - float(don_hi40.iloc[-1])) / fyt * 100
-
-        return {
-            "ticker"  : ticker,
-            "piyasa"  : piyasa,
-            "giris"   : round(fyt, 2),
-            "sl"      : round(sl, 2),
-            "tp1"     : round(tp1, 2),
-            "tp2"     : round(tp2, 2),
-            "tp3"     : round(tp3, 2),
-            "atr"     : round(N, 2),
-            "don_hi"  : round(float(don_hi40.iloc[-1]), 2),
-            "don_ex"  : round(float(don_ex20.iloc[-1]), 2),
-            "mesafe"  : round(mesafe, 2),
-            "mktcap"  : mktcap,
-        }, None
-
-    except Exception as e:
-        return None, str(e)
-
 def hisse_analiz(ticker):
     try:
         piyasa  = "BIST" if ticker.endswith(".IS") else "ABD"
-        min_cap = 10_000_000_000
+        min_cap = 0 if ticker.endswith(".IS") else 1_000_000_000
         try:
             bilgi  = yf.Ticker(ticker).info
             mktcap = bilgi.get("marketCap", 0) or 0
         except:
             mktcap = 0
-        if mktcap > 0 and mktcap < min_cap:
+        if min_cap > 0 and mktcap > 0 and mktcap < min_cap:
             return None, f"Kucuk sirket ({mktcap/1e9:.1f}B)"
 
         df = None
-        for deneme in range(3):
+        for _ in range(3):
             try:
                 df = yf.download(ticker, period="2y", interval="1d", progress=False, auto_adjust=True)
                 if df is not None and len(df) >= 250:
@@ -193,6 +203,7 @@ def hisse_analiz(ticker):
                 time.sleep(1)
             except:
                 time.sleep(2)
+
         if df is None or len(df) < 250:
             return None, "Yeterli veri yok"
 
@@ -202,45 +213,36 @@ def hisse_analiz(ticker):
 
         ema200  = tv_ema(close, 200)
         trendOK = bool(close.iloc[-1] > ema200.iloc[-1])
-
         _, _, adx_s = tv_dmi(df, 14)
         adx_val = float(adx_s.iloc[-1])
         adxOK   = adx_val >= 15
-
         rsi_s   = tv_rsi(close, 14)
         rsi_val = float(rsi_s.iloc[-1])
         rsiOK   = 45 <= rsi_val <= 80
-
         ml, ms, mh = tv_macd(close, 12, 26, 9)
         macdOK = bool(ml.iloc[-1] > ms.iloc[-1]) and bool(mh.iloc[-1] > 0)
-
         don_hi = high.rolling(40).max().shift(1)
         brkout = bool(close.iloc[-1] > don_hi.iloc[-1])
-
-        N_s  = tv_atr(df, 20)
-        N    = float(N_s.iloc[-1])
-        risk = N * 2.0
-        fyt  = float(close.iloc[-1])
-        sl   = fyt - risk
-        tp1  = fyt + risk * 1.5
-        tp2  = fyt + risk * 3.0
-        tp3  = fyt + risk * 5.0
-
+        N_s    = tv_atr(df, 20)
+        N      = float(N_s.iloc[-1])
+        risk   = N * 2.0
+        fyt    = float(close.iloc[-1])
+        sl     = fyt - risk
+        tp1    = fyt + risk * 1.5
+        tp2    = fyt + risk * 3.0
+        tp3    = fyt + risk * 5.0
         emalar = [float(tv_ema(close, p).iloc[-1]) for p in [5,8,13,34,55,89,144,233]]
         fib    = sum(emalar[i] > emalar[i+1] for i in range(7))
         fibOK  = fib >= 5
-
         master    = trendOK and adxOK and rsiOK and macdOK and brkout and fibOK
         uls_score = sum([trendOK, adxOK, rsiOK, macdOK, brkout])
-
         eksik = []
         if not trendOK: eksik.append("EMA200")
-        if not adxOK:   eksik.append(f"ADX({adx_val:.0f})<15")
-        if not rsiOK:   eksik.append(f"RSI({rsi_val:.0f}) 45-80 olmali")
+        if not adxOK:   eksik.append(f"ADX({adx_val:.0f})")
+        if not rsiOK:   eksik.append(f"RSI({rsi_val:.0f})")
         if not macdOK:  eksik.append("MACD")
         if not brkout:  eksik.append("Turtle")
         if not fibOK:   eksik.append(f"Fib({fib}/7)")
-
         return {
             "ticker":ticker,"piyasa":piyasa,"master":master,
             "giris":round(fyt,2),"sl":round(sl,2),
@@ -255,23 +257,69 @@ def hisse_analiz(ticker):
     except Exception as e:
         return None, str(e)
 
+def turtle_analiz(ticker):
+    try:
+        piyasa  = "BIST" if ticker.endswith(".IS") else "ABD"
+        min_cap = 0 if ticker.endswith(".IS") else 1_000_000_000
+        try:
+            bilgi  = yf.Ticker(ticker).info
+            mktcap = bilgi.get("marketCap", 0) or 0
+        except:
+            mktcap = 0
+        if min_cap > 0 and mktcap > 0 and mktcap < min_cap:
+            return None, "Kucuk sirket"
+        df = None
+        for _ in range(3):
+            try:
+                df = yf.download(ticker, period="2y", interval="1d", progress=False, auto_adjust=True)
+                if df is not None and len(df) >= 45:
+                    break
+                time.sleep(1)
+            except:
+                time.sleep(2)
+        if df is None or len(df) < 45:
+            return None, "Yeterli veri yok"
+        close = df["Close"].squeeze()
+        high  = df["High"].squeeze()
+        low   = df["Low"].squeeze()
+        don_hi40 = high.rolling(40).max().shift(1)
+        don_ex20 = low.rolling(20).min().shift(1)
+        brkout   = bool(close.iloc[-1] > don_hi40.iloc[-1])
+        if not brkout:
+            return None, "Kirilim yok"
+        N_s  = tv_atr(df, 20)
+        N    = float(N_s.iloc[-1])
+        risk = N * 2.0
+        fyt  = float(close.iloc[-1])
+        return {
+            "ticker" : ticker, "piyasa"  : piyasa,
+            "giris"  : round(fyt, 2), "sl" : round(fyt - risk, 2),
+            "tp1"    : round(fyt + risk * 1.5, 2),
+            "tp2"    : round(fyt + risk * 3.0, 2),
+            "tp3"    : round(fyt + risk * 5.0, 2),
+            "atr"    : round(N, 2),
+            "don_hi" : round(float(don_hi40.iloc[-1]), 2),
+            "don_ex" : round(float(don_ex20.iloc[-1]), 2),
+            "mesafe" : round((fyt - float(don_hi40.iloc[-1])) / fyt * 100, 2),
+            "mktcap" : mktcap,
+        }, None
+    except Exception as e:
+        return None, str(e)
+
 # ══════════════════════════════════════════════
 # HİSSE LİSTELERİ
 # ══════════════════════════════════════════════
 BIST_HISSELER = [
-    # BIST 30
     "AKBNK.IS","ARCLK.IS","ASELS.IS","BIMAS.IS","DOHOL.IS",
     "EKGYO.IS","ENKAI.IS","EREGL.IS","FROTO.IS","GARAN.IS",
     "HALKB.IS","ISCTR.IS","KCHOL.IS","KOZAL.IS","KRDMD.IS",
     "MGROS.IS","PETKM.IS","PGSUS.IS","SAHOL.IS","SASA.IS",
     "SISE.IS","TAVHL.IS","TCELL.IS","THYAO.IS","TKFEN.IS",
     "TOASO.IS","TTKOM.IS","TUPRS.IS","VAKBN.IS","YKBNK.IS",
-    # BIST 50
     "AEFES.IS","AGESA.IS","AKSEN.IS","ALARK.IS","AYGAZ.IS",
     "BRYAT.IS","CCOLA.IS","CIMSA.IS","CLEBI.IS","GUBRF.IS",
     "ISGYO.IS","KARSN.IS","KOZAA.IS","LOGO.IS","MAVI.IS",
     "ODAS.IS","OTKAR.IS","SARKY.IS","SOKM.IS","TSKB.IS",
-    # BIST 100
     "AGHOL.IS","AKGRT.IS","ALKIM.IS","ANELE.IS","ASUZU.IS",
     "AVGYO.IS","AYDEM.IS","BAGFS.IS","BIOEN.IS","BIZIM.IS",
     "CEMTS.IS","DEVA.IS","ENJSA.IS","ERBOS.IS","EUPWR.IS",
@@ -292,7 +340,6 @@ BIST_HISSELER = [
     "RGYAS.IS","RODRG.IS","SAFKR.IS","SELGD.IS","SEYKM.IS",
     "SILVR.IS","SNKRN.IS","SRVGY.IS","TLMAN.IS","TRCAS.IS",
     "ULUUN.IS","UMPAS.IS","USAK.IS","YAPRK.IS",
-    # BIST 200+
     "ADEL.IS","AFYON.IS","AGYO.IS","AKCNS.IS","AKFEN.IS",
     "AKSA.IS","AKSY.IS","ALCAR.IS","ALKA.IS","ALVES.IS",
     "ARENA.IS","ARTMS.IS","ATEKS.IS","ATLAS.IS","AYCES.IS",
@@ -329,13 +376,14 @@ BIST_HISSELER = [
     "AZTEK.IS","CMENT.IS","DGNMO.IS","DMRGD.IS","DNISI.IS",
     "DURDO.IS","DZGYO.IS","EGSER.IS","EMPIN.IS","ESCAR.IS",
     "GARFA.IS","GLRYH.IS","IEYHO.IS","KCAER.IS","KZBGY.IS",
-    "MANAS.IS","OBAMS.IS","OSTIM.IS","PAMEL.IS","PKENT.IS",
-    "QUAGR.IS","RALYH.IS","RUBNS.IS","SAMAT.IS","SANKO.IS",
-    "SAYAS.IS","SEKUR.IS","SKBNK.IS","SUMAS.IS","SURGY.IS",
-    "TGSAS.IS","TURGG.IS","VAKFN.IS","VAKKO.IS","ZOREN.IS"
+    "OBAMS.IS","OSTIM.IS","PKENT.IS","QUAGR.IS","RALYH.IS",
+    "RUBNS.IS","SAMAT.IS","SANKO.IS","SEKUR.IS","SKBNK.IS",
+    "SUMAS.IS","SURGY.IS","TGSAS.IS","TURGG.IS","VAKFN.IS",
+    "VAKKO.IS","ZOREN.IS","RGYO.IS"
 ]
+BIST_HISSELER = list(dict.fromkeys(BIST_HISSELER))
 
-ABD_HISSELER = [
+ABD_HISSELER = list(dict.fromkeys([
     "AAPL","MSFT","NVDA","AVGO","ORCL","CRM","ADBE","AMD","QCOM","TXN",
     "INTC","AMAT","MU","LRCX","KLAC","MRVL","SNPS","CDNS","ANSS","CTSH",
     "HPQ","IBM","CSCO","ACN","INTU","NOW","WDAY","TEAM","PANW","CRWD",
@@ -368,19 +416,20 @@ ABD_HISSELER = [
     "PCG","EIX","WEC","NRG","VST","GOOGL","GOOG","META","T","VZ",
     "TMUS","CHTR","CMCSA","DIS","NFLX","PARA","WBD","FOXA","SNAP","PINS",
     "SPOT","BRK-B","MSCI","NDAQ"
-]
+]))
 
 # ══════════════════════════════════════════════
 # MESAJ FORMATLARI
 # ══════════════════════════════════════════════
-def sinyal_mesaji(s):
+def sinyal_mesaji(s, sinyal_id=None):
     bayrak = "🇹🇷" if s["piyasa"] == "BIST" else "🇺🇸"
     para   = "₺" if s["piyasa"] == "BIST" else "$"
     yildiz = "⭐" * s["fib"] + "☆" * (7 - s["fib"])
-    cap    = f"{s['mktcap']/1e9:.1f}B {para}" if s["mktcap"] > 0 else "?"
+    cap    = f"{s['mktcap']/1e9:.1f}B {para}" if s.get("mktcap", 0) > 0 else "?"
+    sid    = f"\n🔢 Sinyal ID: #{sinyal_id}" if sinyal_id else ""
     return (
-        f"{bayrak} <b>{s['ticker']}</b> [{s['piyasa']}]\n"
-        f"💹 Piyasa Degeri: {cap}\n"
+        f"{bayrak} <b>{s['ticker']}</b> [{s['piyasa']}] 🚀 AL SİNYALİ\n"
+        f"💹 Piyasa Degeri: {cap}{sid}\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"💰 Giris: {para}{s['giris']}\n"
         f"🛑 S/L:   {para}{s['sl']}\n"
@@ -393,6 +442,7 @@ def sinyal_mesaji(s):
         f"⭐ Fib: {yildiz} {s['fib']}/7\n"
         f"✅ ULS: {s['uls']}/5\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
+        f"💼 Sim: $1.000 yatirim / $100K portfoy\n"
         f"⚠️ Yatirim tavsiyesi degildir."
     )
 
@@ -402,7 +452,7 @@ def detay_mesaji(s):
     para   = "₺" if s["piyasa"] == "BIST" else "$"
     sonuc  = "🚀 SİNYAL VAR!" if s["master"] else "❌ Sinyal yok"
     ekstra = f"\nGecmeyen: {', '.join(s['eksik'])}" if not s["master"] and s["eksik"] else ""
-    cap    = f"{s['mktcap']/1e9:.1f}B {para}" if s["mktcap"] > 0 else "?"
+    cap    = f"{s['mktcap']/1e9:.1f}B {para}" if s.get("mktcap", 0) > 0 else "?"
     return (
         f"{bayrak} <b>{s['ticker']}</b> [{s['piyasa']}]\n"
         f"💹 Piyasa Degeri: {cap}\n"
@@ -424,49 +474,197 @@ def detay_mesaji(s):
     )
 
 # ══════════════════════════════════════════════
+# İSTATİSTİK
+# ══════════════════════════════════════════════
+def istatistik_hesapla(gun_limit=None):
+    db = db_oku()
+    sinyaller = db["sinyaller"]
+    if gun_limit:
+        limit = datetime.now() - timedelta(days=gun_limit)
+        sinyaller = [s for s in sinyaller
+                     if datetime.strptime(s["tarih"], "%Y-%m-%d %H:%M") >= limit]
+
+    kapali = [s for s in sinyaller if s["durum"] != "ACIK"]
+    acik   = [s for s in sinyaller if s["durum"] == "ACIK"]
+
+    if not kapali:
+        return None
+
+    toplam  = len(kapali)
+    kazanan = len([s for s in kapali if s.get("sonuc") == "KAR"])
+    kaybeden= len([s for s in kapali if s.get("sonuc") == "ZARAR"])
+    net_pnl = sum(s.get("kar_zarar", 0) or 0 for s in kapali)
+    wr      = kazanan / toplam * 100 if toplam > 0 else 0
+
+    # $100K portfoy simülasyonu (her islem $1000)
+    portfoy = 100000 + net_pnl
+
+    return {
+        "toplam"  : toplam,
+        "kazanan" : kazanan,
+        "kaybeden": kaybeden,
+        "acik"    : len(acik),
+        "wr"      : round(wr, 1),
+        "net_pnl" : round(net_pnl, 2),
+        "portfoy" : round(portfoy, 2)
+    }
+
+def istatistik_mesaji(donem, gun_limit=None):
+    st = istatistik_hesapla(gun_limit)
+    if not st:
+        return f"📊 <b>{donem}</b>\n\nHenuz kapali islem yok."
+
+    pnl_emoji = "📈" if st["net_pnl"] >= 0 else "📉"
+    return (
+        f"📊 <b>İSTATİSTİK — {donem}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"📋 Toplam Islem: {st['toplam']}\n"
+        f"✅ Kazanan: {st['kazanan']}\n"
+        f"❌ Kaybeden: {st['kaybeden']}\n"
+        f"🔄 Acik: {st['acik']}\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 Kazanma Orani: %{st['wr']}\n"
+        f"{pnl_emoji} Net P&L: {'+'if st['net_pnl']>=0 else''}${st['net_pnl']:,.2f}\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"💼 Portfoy: ${st['portfoy']:,.2f}\n"
+        f"📈 Baslangiç: $100,000.00\n"
+        f"{'📈' if st['portfoy']>=100000 else '📉'} Degisim: {'+'if st['portfoy']>=100000 else''}${st['portfoy']-100000:,.2f}\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"💡 Her islem $1.000 / Toplam $100.000"
+    )
+
+def acik_pozisyonlar_mesaji():
+    db = db_oku()
+    aciklar = [s for s in db["sinyaller"] if s["durum"] == "ACIK"]
+    if not aciklar:
+        return "📋 <b>Acik Pozisyon Yok</b>"
+
+    mesaj = f"📋 <b>ACIK POZİSYONLAR ({len(aciklar)} adet)</b>\n━━━━━━━━━━━━━━━━━━━\n"
+    for s in aciklar[-10:]:
+        bayrak = "🇹🇷" if s["piyasa"] == "BIST" else "🇺🇸"
+        para   = "₺" if s["piyasa"] == "BIST" else "$"
+        mesaj += (
+            f"{bayrak} <b>{s['ticker']}</b>\n"
+            f"  Giris: {para}{s['giris']} | SL: {para}{s['sl']}\n"
+            f"  TP1: {para}{s['tp1']} | Tarih: {s['tarih']}\n\n"
+        )
+    return mesaj
+
+def gecmis_mesaji(adet=10):
+    db = db_oku()
+    kapali = [s for s in db["sinyaller"] if s["durum"] != "ACIK"][-adet:]
+    if not kapali:
+        return "📋 <b>Gecmis Islem Yok</b>"
+
+    mesaj = f"📋 <b>SON {len(kapali)} İŞLEM</b>\n━━━━━━━━━━━━━━━━━━━\n"
+    for s in reversed(kapali):
+        emoji  = "✅" if s.get("sonuc") == "KAR" else "❌"
+        bayrak = "🇹🇷" if s["piyasa"] == "BIST" else "🇺🇸"
+        pnl    = s.get("kar_zarar", 0) or 0
+        mesaj += f"{emoji} {bayrak} {s['ticker']} → {'+'if pnl>=0 else''}${pnl:.2f} ({s['tarih'][:10]})\n"
+    return mesaj
+
+# ══════════════════════════════════════════════
 # TARAMA
 # ══════════════════════════════════════════════
+gonderilen_sinyaller = set()
+
 def tarama_yap(hisseler, baslik):
+    global gonderilen_sinyaller
     simdi     = datetime.now().strftime("%d.%m.%Y %H:%M")
     sinyaller = []
-    telegram_gonder(
-        f"🔍 <b>{baslik} TARANIYOR</b>\n"
-        f"⏰ {simdi}\n"
-        f"📊 {len(hisseler)} hisse kontrol ediliyor..."
-    )
+    kullanicilar = aktif_kullanicilar()
+
+    print(f"{baslik} taranıyor... ({len(hisseler)} hisse)")
+
     for ticker in hisseler:
         print(f"  {ticker}...", end=" ", flush=True)
         sonuc, _ = hisse_analiz(ticker)
         if sonuc and sonuc["master"]:
-            sinyaller.append(sonuc)
-            print("SINYAL!")
+            # Ayni gun ayni hisse tekrar gonderilmesin
+            bugun = datetime.now().strftime("%Y-%m-%d")
+            anahtar = f"{ticker}_{bugun}"
+            if anahtar not in gonderilen_sinyaller:
+                sinyaller.append(sonuc)
+                gonderilen_sinyaller.add(anahtar)
+                print("SİNYAL!")
+            else:
+                print("(zaten gonderildi)")
         else:
             print("-")
         time.sleep(0.3)
 
     if not sinyaller:
-        telegram_gonder(f"📊 <b>{baslik}</b> tamamlandi — sinyal bulunamadi.")
+        print(f"{baslik}: sinyal yok")
         return
 
-    telegram_gonder(
-        f"🚀 <b>{baslik} SINYALLERI</b>\n"
-        f"⏰ {simdi}\n"
-        f"📊 {len(sinyaller)} sinyal bulundu!"
+    ozet = (
+        f"🚀 <b>{baslik} — {len(sinyaller)} YENİ SİNYAL</b>\n"
+        f"⏰ {simdi}"
     )
+    for cid in kullanicilar:
+        telegram_gonder(ozet, cid)
     time.sleep(1)
+
     for s in sinyaller:
-        telegram_gonder(sinyal_mesaji(s))
-        time.sleep(0.8)
+        sid = sinyal_kaydet(
+            s["ticker"], s["piyasa"], s["giris"],
+            s["sl"], s["tp1"], s["tp2"], s["tp3"],
+            s["atr"], s["fib"], s["uls"]
+        )
+        mesaj = sinyal_mesaji(s, sid)
+        for cid in kullanicilar:
+            telegram_gonder(mesaj, cid)
+            time.sleep(0.3)
+        time.sleep(0.5)
+
+def turtle_tarama_yap(hisseler, baslik):
+    simdi        = datetime.now().strftime("%d.%m.%Y %H:%M")
+    sinyaller    = []
+    kullanicilar = aktif_kullanicilar()
+
+    for ticker in hisseler:
+        sonuc, _ = turtle_analiz(ticker)
+        if sonuc:
+            sinyaller.append(sonuc)
+        time.sleep(0.3)
+
+    if not sinyaller:
+        return
+
+    ozet = f"🐢 <b>{baslik} TURTLE — {len(sinyaller)} KİRİLİM</b>\n⏰ {simdi}"
+    for cid in kullanicilar:
+        telegram_gonder(ozet, cid)
+    time.sleep(1)
+
+    for s in sinyaller:
+        bayrak = "🇹🇷" if s["piyasa"] == "BIST" else "🇺🇸"
+        para   = "₺" if s["piyasa"] == "BIST" else "$"
+        mesaj  = (
+            f"🐢 {bayrak} <b>{s['ticker']}</b> — 40G KİRİLİM\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"💰 Giris: {para}{s['giris']}\n"
+            f"🛑 S/L:   {para}{s['sl']}\n"
+            f"🎯 TP1:  {para}{s['tp1']}\n"
+            f"🎯 TP2:  {para}{s['tp2']}\n"
+            f"🎯 TP3:  {para}{s['tp3']}\n"
+            f"📏 40G Yuksek: {para}{s['don_hi']}\n"
+            f"🚪 Cikis 20G:  {para}{s['don_ex']}\n"
+            f"📐 Mesafe: %{s['mesafe']}\n"
+            f"⚠️ Yatirim tavsiyesi degildir."
+        )
+        for cid in kullanicilar:
+            telegram_gonder(mesaj, cid)
+            time.sleep(0.3)
+        time.sleep(0.5)
 
 def bist_tarama():
     global tarama_aktif
     with tarama_kilidi:
         if tarama_aktif:
-            print("Tarama zaten devam ediyor, atlandi.")
             return
         tarama_aktif = True
     try:
-        print(f"\nBIST TARAMA: {datetime.now().strftime('%H:%M')}")
         tarama_yap(BIST_HISSELER, "BIST")
     finally:
         tarama_aktif = False
@@ -475,67 +673,12 @@ def abd_tarama():
     global tarama_aktif
     with tarama_kilidi:
         if tarama_aktif:
-            print("Tarama zaten devam ediyor, atlandi.")
             return
         tarama_aktif = True
     try:
-        print(f"\nABD TARAMA: {datetime.now().strftime('%H:%M')}")
-        tarama_yap(ABD_HISSELER, f"ABD S&P500+ ({len(ABD_HISSELER)} hisse)")
+        tarama_yap(ABD_HISSELER, "ABD")
     finally:
         tarama_aktif = False
-
-
-def turtle_tarama_yap(hisseler, baslik):
-    simdi     = datetime.now().strftime("%d.%m.%Y %H:%M")
-    sinyaller = []
-    telegram_gonder(
-        f"🐢 <b>{baslik} TURTLE TARAMASI</b>\n"
-        f"⏰ {simdi}\n"
-        f"📊 {len(hisseler)} hisse - 40G Dennis Sistemi"
-    )
-    for ticker in hisseler:
-        print(f"  TURTLE {ticker}...", end=" ", flush=True)
-        sonuc, _ = turtle_analiz(ticker)
-        if sonuc:
-            sinyaller.append(sonuc)
-            print("KIRILIM!")
-        else:
-            print("-")
-        time.sleep(0.3)
-
-    if not sinyaller:
-        telegram_gonder(f"🐢 <b>{baslik} TURTLE</b> — Kirilim bulunamadi.")
-        return
-
-    telegram_gonder(
-        f"🐢 <b>{baslik} TURTLE SINYALLERI</b>\n"
-        f"⏰ {simdi}\n"
-        f"📊 {len(sinyaller)} hisse 40G kirildi!"
-    )
-    time.sleep(1)
-    for s in sinyaller:
-        bayrak = "🇹🇷" if s["piyasa"] == "BIST" else "🇺🇸"
-        para   = "₺" if s["piyasa"] == "BIST" else "$"
-        cap    = f"{s['mktcap']/1e9:.1f}B {para}" if s["mktcap"] > 0 else "?"
-        mesaj  = (
-            f"🐢 {bayrak} <b>{s['ticker']}</b> — 40G KIRILIM\n"
-            f"💹 Piyasa Degeri: {cap}\n"
-            f"━━━━━━━━━━━━━━━━━━━\n"
-            f"💰 Giris:    {para}{s['giris']}\n"
-            f"🛑 S/L:      {para}{s['sl']}\n"
-            f"🎯 TP1:     {para}{s['tp1']}\n"
-            f"🎯 TP2:     {para}{s['tp2']}\n"
-            f"🎯 TP3:     {para}{s['tp3']}\n"
-            f"━━━━━━━━━━━━━━━━━━━\n"
-            f"📏 40G Yuksek: {para}{s['don_hi']}\n"
-            f"🚪 Cikis 20G:  {para}{s['don_ex']}\n"
-            f"🔢 ATR (N):    {para}{s['atr']}\n"
-            f"📐 Mesafe:     %{s['mesafe']}\n"
-            f"━━━━━━━━━━━━━━━━━━━\n"
-            f"⚠️ Yatirim tavsiyesi degildir."
-        )
-        telegram_gonder(mesaj)
-        time.sleep(0.8)
 
 def bist_turtle():
     global tarama_aktif
@@ -560,52 +703,84 @@ def abd_turtle():
         tarama_aktif = False
 
 # ══════════════════════════════════════════════
-# TELEGRAM DINLEYICI
+# TELEGRAM DİNLEYİCİ
 # ══════════════════════════════════════════════
 def yardim_mesaji():
     return (
-        "🤖 <b>ULS+FIB Borsa Botu v4</b>\n\n"
-        f"🇹🇷 BIST: {len(BIST_HISSELER)} hisse → 18:30\n"
-        f"🇺🇸 ABD S&P500+: {len(ABD_HISSELER)} hisse → 23:30\n\n"
-        "Hisse analizi:\n"
-        "THYAO / THYAO.IS → BIST\n"
-        "AAPL / NVDA / JPM → ABD\n\n"
-        "Komutlar:\n"
-        "/bist   BIST tara\n"
-        "/abd    ABD tara\n"
-        "/tara   Hepsini tara\n"
-        "/liste  Kac hisse var\n"
-        "/yardim Bu menu\n\n"
-        "🐢 Turtle Komutlar:\n"
-        "/turtle_bist  BIST Turtle tara\n"
-        "/turtle_abd   ABD Turtle tara\n"
-        "/turtle_tara  Her ikisi Turtle"
+        "🤖 <b>ULS+FIB Sinyal Botu</b>\n\n"
+        "👤 Kayit:\n"
+        "/basla — Sisteme katil\n\n"
+        "📊 Analiz:\n"
+        "THYAO / AAPL — Hisse analiz\n\n"
+        "🔍 Tarama:\n"
+        "/bist — BIST tara\n"
+        "/abd  — ABD tara\n"
+        "/tb   — BIST Turtle\n"
+        "/ta   — ABD Turtle\n\n"
+        "📈 İstatistik:\n"
+        "/stat_hafta  — Haftalık\n"
+        "/stat_ay     — Aylık\n"
+        "/stat_3ay    — 3 Aylık\n"
+        "/stat_yil    — Yıllık\n"
+        "/stat_tum    — Tüm zamanlar\n\n"
+        "💼 Portföy:\n"
+        "/acik    — Acik pozisyonlar\n"
+        "/gecmis  — Son 10 islem\n\n"
+        "⏰ Otomatik: BIST 18:30 / ABD 23:30"
     )
 
-def mesaji_isle(metin, chat_id):
+def mesaji_isle(metin, chat_id, isim):
     cmd = metin.strip().upper()
 
-    if cmd in ["/START", "/YARDIM", "/HELP"]:
+    # KAYIT
+    if cmd in ["/BASLA", "/START"]:
+        yeni = kullanici_ekle(chat_id, isim)
+        if yeni:
+            telegram_gonder(
+                f"✅ <b>Hos geldin {isim}!</b>\n\n"
+                f"Sisteme kayit oldun.\n"
+                f"Otomatik sinyaller gelecek.\n\n"
+                f"/yardim — Tum komutlar", chat_id)
+        else:
+            telegram_gonder(f"✅ Zaten kayitlisin {isim}!\n/yardim — Komutlar", chat_id)
+        return
+
+    if cmd in ["/YARDIM", "/HELP"]:
         telegram_gonder(yardim_mesaji(), chat_id)
         return
-    if cmd == "/LISTE":
-        telegram_gonder(
-            f"📊 <b>Tarama Listesi</b>\n\n"
-            f"🇹🇷 BIST: {len(BIST_HISSELER)} hisse\n"
-            f"🇺🇸 ABD S&P500+: {len(ABD_HISSELER)} hisse\n"
-            f"📊 Toplam: {len(BIST_HISSELER)+len(ABD_HISSELER)} hisse\n\n"
-            f"Filtreler:\n"
-            f"💹 Piyasa degeri 10B+\n"
-            f"✅ EMA200 + ADX + RSI\n"
-            f"✅ MACD + Turtle 40G\n"
-            f"✅ Fibonacci 5/7+", chat_id)
+
+    # İSTATİSTİK
+    if cmd == "/STAT_HAFTA":
+        telegram_gonder(istatistik_mesaji("HAFTALIK", 7), chat_id)
         return
+    if cmd == "/STAT_AY":
+        telegram_gonder(istatistik_mesaji("AYLIK", 30), chat_id)
+        return
+    if cmd == "/STAT_3AY":
+        telegram_gonder(istatistik_mesaji("3 AYLIK", 90), chat_id)
+        return
+    if cmd == "/STAT_YIL":
+        telegram_gonder(istatistik_mesaji("YILLIK", 365), chat_id)
+        return
+    if cmd == "/STAT_TUM":
+        telegram_gonder(istatistik_mesaji("TUM ZAMANLAR"), chat_id)
+        return
+
+    # PORTFOY
+    if cmd == "/ACIK":
+        telegram_gonder(acik_pozisyonlar_mesaji(), chat_id)
+        return
+    if cmd == "/GECMIS":
+        telegram_gonder(gecmis_mesaji(), chat_id)
+        return
+
+    # TARAMA
     if cmd == "/BIST":
         telegram_gonder("🇹🇷 BIST taramasi baslatiliyor...", chat_id)
         threading.Thread(target=bist_tarama, daemon=True).start()
         return
     if cmd == "/ABD":
-        telegram_gonder(f"🇺🇸 ABD taramasi baslatiliyor ({len(ABD_HISSELER)} hisse)...", chat_id)
+        telegram_gonder("🇺🇸 ABD taramasi baslatiliyor...", chat_id)
         threading.Thread(target=abd_tarama, daemon=True).start()
         return
     if cmd == "/TARA":
@@ -613,21 +788,33 @@ def mesaji_isle(metin, chat_id):
         threading.Thread(target=bist_tarama, daemon=True).start()
         threading.Thread(target=abd_tarama,  daemon=True).start()
         return
-    if cmd in ["/TURTLE_BIST", "/TURTLEBIST", "/TB"]:
-        telegram_gonder("🐢 BIST Turtle taramasi baslatiliyor...", chat_id)
+    if cmd in ["/TB", "/TURTLE_BIST"]:
+        telegram_gonder("🐢 BIST Turtle baslatiliyor...", chat_id)
         threading.Thread(target=bist_turtle, daemon=True).start()
         return
-    if cmd in ["/TURTLE_ABD", "/TURTLEABD", "/TA"]:
-        telegram_gonder("🐢 ABD Turtle taramasi baslatiliyor...", chat_id)
+    if cmd in ["/TA", "/TURTLE_ABD"]:
+        telegram_gonder("🐢 ABD Turtle baslatiliyor...", chat_id)
         threading.Thread(target=abd_turtle, daemon=True).start()
         return
-    if cmd in ["/TURTLE_TARA", "/TURTLETARA", "/TT"]:
+    if cmd in ["/TT", "/TURTLE_TARA"]:
         telegram_gonder("🐢 Turtle taramasi baslatiliyor...", chat_id)
         threading.Thread(target=bist_turtle, daemon=True).start()
         threading.Thread(target=abd_turtle,  daemon=True).start()
         return
 
+    # LISTE
+    if cmd == "/LISTE":
+        telegram_gonder(
+            f"📊 <b>Tarama Listesi</b>\n\n"
+            f"🇹🇷 BIST: {len(BIST_HISSELER)} hisse\n"
+            f"🇺🇸 ABD: {len(ABD_HISSELER)} hisse\n"
+            f"📊 Toplam: {len(BIST_HISSELER)+len(ABD_HISSELER)} hisse", chat_id)
+        return
+
+    # HİSSE ANALİZ
     ticker = cmd.replace("/", "")
+    if len(ticker) < 2:
+        return
     telegram_gonder(f"🔍 <b>{ticker}</b> analiz ediliyor...", chat_id)
     sonuc, hata = hisse_analiz(ticker)
     if sonuc is None and not ticker.endswith(".IS"):
@@ -635,7 +822,7 @@ def mesaji_isle(metin, chat_id):
     if sonuc is None:
         telegram_gonder(
             f"❌ <b>{ticker}</b> bulunamadi.\n"
-            f"BIST: THYAO veya THYAO.IS\n"
+            f"BIST: THYAO / THYAO.IS\n"
             f"ABD: AAPL, MSFT, JPM\n"
             f"Hata: {hata}", chat_id)
         return
@@ -644,10 +831,10 @@ def mesaji_isle(metin, chat_id):
 def telegram_dinle():
     global son_update_id
     print("Telegram dinleniyor...")
-    # Eski mesajlari atla - bot yeniden basladiginda gecmis mesajlari isleme
+    # Eski mesajlari atla
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
-        r = requests.get(url, params={"offset": -1}, timeout=10)
+        r   = requests.get(url, params={"offset": -1}, timeout=10)
         if r.status_code == 200:
             sonuclar = r.json().get("result", [])
             if sonuclar:
@@ -663,8 +850,13 @@ def telegram_dinle():
                 if "message" in m and "text" in m["message"]:
                     metin   = m["message"]["text"]
                     chat_id = m["message"]["chat"]["id"]
-                    print(f"Mesaj: '{metin}'")
-                    threading.Thread(target=mesaji_isle, args=(metin, chat_id), daemon=True).start()
+                    isim    = m["message"].get("from", {}).get("first_name", "Kullanici")
+                    print(f"Mesaj [{chat_id}]: '{metin}'")
+                    threading.Thread(
+                        target=mesaji_isle,
+                        args=(metin, chat_id, isim),
+                        daemon=True
+                    ).start()
             time.sleep(2)
         except Exception as e:
             print(f"Dinleme hatasi: {e}")
@@ -674,28 +866,35 @@ def telegram_dinle():
 # ANA PROGRAM
 # ══════════════════════════════════════════════
 if __name__ == "__main__":
-    print(f"ULS+FIB BORSA BOTU v4")
-    print(f"BIST: {len(BIST_HISSELER)} hisse - 18:30")
-    print(f"ABD:  {len(ABD_HISSELER)} hisse - 23:30")
-    print(f"Durdurmak: CTRL+C\n")
+    print("ULS+FIB SİNYAL BOTU")
+    print(f"BIST: {len(BIST_HISSELER)} hisse")
+    print(f"ABD:  {len(ABD_HISSELER)} hisse")
+    print("Durdurmak: CTRL+C\n")
+
+    # Admin kaydı
+    kullanici_ekle(TELEGRAM_CHAT_ID, "Admin")
 
     telegram_gonder(
-        f"✅ <b>ULS+FIB Botu v4 Aktif!</b>\n\n"
+        "✅ <b>ULS+FIB Sinyal Botu Aktif!</b>\n\n"
         f"🇹🇷 BIST: {len(BIST_HISSELER)} hisse → 18:30\n"
-        f"🇺🇸 ABD S&P500+: {len(ABD_HISSELER)} hisse → 23:30\n\n"
-        f"📐 TradingView tam uyumlu\n"
-        f"📊 Filtreler: RSI 45-80 | ADX 15+\n"
-        f"💹 Piyasa degeri filtresi: 10B+\n\n"
-        f"Test: THYAO veya AAPL yaz\n"
-        f"/yardim → komutlar"
+        f"🇺🇸 ABD: {len(ABD_HISSELER)} hisse → 23:30\n\n"
+        "📊 Yeni ozellikler:\n"
+        "✅ Coklu kullanici\n"
+        "✅ Sinyal gecmisi\n"
+        "✅ P&L istatistigi\n"
+        "✅ $100K portfoy sim.\n\n"
+        "/basla — Sisteme katil\n"
+        "/yardim — Tum komutlar"
     )
     print("Bot aktif!\n")
 
+    # Zamanlayici
     schedule.every().day.at("18:30").do(bist_tarama)
     schedule.every().day.at("19:00").do(bist_turtle)
     schedule.every().day.at("23:30").do(abd_tarama)
     schedule.every().day.at("00:00").do(abd_turtle)
 
+    # Telegram dinleyici
     threading.Thread(target=telegram_dinle, daemon=True).start()
 
     while True:
